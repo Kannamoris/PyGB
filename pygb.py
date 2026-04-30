@@ -9,6 +9,7 @@ cartridge when the emulator is closed.
 
 import sys
 import os
+import platform
 import time
 import copy
 import shutil
@@ -18,6 +19,103 @@ import subprocess
 import argparse
 import configparser
 import re
+
+# ---------------------------------------------------------------------------
+# Platform helpers
+# ---------------------------------------------------------------------------
+_SYSTEM = platform.system()   # "Linux", "Windows", "Darwin"
+
+
+def _is_windows():
+    return _SYSTEM == "Windows"
+
+
+def _is_mac():
+    return _SYSTEM == "Darwin"
+
+
+def _core_ext():
+    """Shared-library extension used by RetroArch cores on this platform."""
+    if _is_windows():
+        return ".dll"
+    if _is_mac():
+        return ".dylib"
+    return ".so"
+
+
+def _retroarch_config_dir():
+    """Root RetroArch configuration directory for this platform."""
+    if _is_windows():
+        return os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RetroArch")
+    if _is_mac():
+        return os.path.expanduser("~/Library/Application Support/RetroArch")
+    return os.path.expanduser("~/.config/retroarch")
+
+
+def _retroarch_core_dirs():
+    """Directories to search for RetroArch core files."""
+    ra_cfg = _retroarch_config_dir()
+    if _is_windows():
+        return [
+            os.path.join(ra_cfg, "cores"),
+            r"C:\RetroArch\cores",
+            r"C:\RetroArch-Win64\cores",
+        ]
+    if _is_mac():
+        return [
+            os.path.join(ra_cfg, "cores"),
+            "/usr/local/lib/libretro",
+            "/opt/homebrew/lib/libretro",
+        ]
+    return [
+        "/usr/lib/libretro",
+        "/usr/lib64/libretro",
+        "/usr/local/lib/libretro",
+        os.path.join(ra_cfg, "cores"),
+        os.path.expanduser("~/.local/share/retroarch/cores"),
+    ]
+
+
+def _retroarch_info_dirs(core_path):
+    """Directories to search for RetroArch core .info files."""
+    ra_cfg = _retroarch_config_dir()
+    dirs = [os.path.dirname(core_path)] if core_path else []
+    if _is_windows():
+        dirs += [os.path.join(ra_cfg, "info")]
+    elif _is_mac():
+        dirs += [
+            os.path.join(ra_cfg, "info"),
+            "/usr/local/share/libretro/info",
+            "/opt/homebrew/share/libretro/info",
+        ]
+    else:
+        dirs += [
+            "/usr/share/libretro/info",
+            "/usr/local/share/libretro/info",
+        ]
+    return dirs
+
+
+def _pygb_data_dir():
+    """Persistent data directory for PyGB (ROM cache, etc.)."""
+    if _is_windows():
+        base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    elif _is_mac():
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+    return os.path.join(base, "pygb")
+
+
+def _pygb_config_dir():
+    """Configuration directory for PyGB."""
+    if _is_windows():
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    elif _is_mac():
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    return os.path.join(base, "pygb")
 
 # ---------------------------------------------------------------------------
 # FlashGBX integration
@@ -38,28 +136,73 @@ GREEN = "\033[92m"
 YELLOW = "\033[93m"
 CYAN = "\033[96m"
 
+# ---------------------------------------------------------------------------
+# GUI toolkit
+# ---------------------------------------------------------------------------
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    _TK_AVAILABLE = True
+except ImportError:
+    _TK_AVAILABLE = False
+
+# Persistent application window (set in main() when running without a terminal)
+_app_window = None
+
+# ---------------------------------------------------------------------------
+# Logging helpers — write to terminal and/or GUI status label
+# ---------------------------------------------------------------------------
 
 def status(msg):
     print(f"{CYAN}[PyGB]{RESET} {msg}")
+    if _app_window is not None:
+        _app_window.set_status(msg)
 
 
 def success(msg):
     print(f"{GREEN}[PyGB]{RESET} {msg}")
+    if _app_window is not None:
+        _app_window.set_status(msg, kind="ok")
 
 
 def warn(msg):
     print(f"{YELLOW}[PyGB]{RESET} {msg}")
+    if _app_window is not None:
+        _app_window.set_status(msg, kind="warn")
 
 
 def error(msg):
     print(f"{RED}[PyGB]{RESET} {msg}")
+    if _app_window is not None:
+        _app_window.set_status(msg, kind="error")
+
+
+def fatal(msg, dev=None):
+    """Log an error, show a GUI dialog if applicable, close the device, and exit."""
+    error(msg)
+    if _app_window is not None:
+        _app_window.show_error_dialog(msg)
+    if dev is not None:
+        try:
+            dev.Close(cartPowerOff=True)
+        except Exception:
+            pass
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
-# Progress callback (thin wrapper around FlashGBX's Progress)
+# Progress — terminal fallback
 # ---------------------------------------------------------------------------
+_OP_LABELS = {
+    "ROM_READ":    "Dumping ROM",
+    "SAVE_READ":   "Reading save",
+    "SAVE_WRITE":  "Writing save",
+    "DETECT_CART": "Detecting cartridge",
+}
+
+
 class ProgressHandler:
-    """Minimal progress handler that prints a progress bar to the terminal."""
+    """Prints a progress bar to the terminal."""
 
     def __init__(self):
         self._size = 0
@@ -68,34 +211,22 @@ class ProgressHandler:
 
     def SetProgress(self, args):
         action = args.get("action", "")
-
         if action == "INITIALIZE":
             self._size = args.get("size", 0)
             self._pos = args.get("pos", 0)
             self._method = args.get("method", "")
-            label = {
-                "ROM_READ": "Dumping ROM",
-                "SAVE_READ": "Reading save",
-                "SAVE_WRITE": "Writing save",
-                "DETECT_CART": "Detecting cartridge",
-            }.get(self._method, self._method)
+            label = _OP_LABELS.get(self._method, self._method)
             status(f"{label}...")
-
         elif action in ("READ", "WRITE"):
             self._pos += args.get("bytes_added", 0)
             self._print_bar()
-
         elif action == "UPDATE_POS":
             self._pos = args.get("pos", self._pos)
             self._print_bar()
-
         elif action == "FINISHED":
             self._print_bar(final=True)
-
         elif action == "ABORT":
-            msg = args.get("info_msg", "Aborted.")
-            error(msg)
-
+            error(args.get("info_msg", "Aborted."))
         elif action == "USER_ACTION":
             msg = args.get("msg", "")
             if msg:
@@ -109,12 +240,388 @@ class ProgressHandler:
         filled = int(bar_len * pct)
         bar = "█" * filled + "░" * (bar_len - filled)
         end = "\n" if final or pct >= 1.0 else "\r"
-        size_str = format_size(self._pos)
-        total_str = format_size(self._size)
         sys.stdout.write(
-            f"  [{bar}] {pct:6.1%}  {size_str} / {total_str}{end}"
+            f"  [{bar}] {pct:6.1%}  {format_size(self._pos)} / {format_size(self._size)}{end}"
         )
         sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# AppWindow — persistent GUI window shown throughout the entire run
+# ---------------------------------------------------------------------------
+
+class AppWindow:
+    """
+    Persistent application window used when PyGB is launched without a terminal
+    (e.g. from a file manager).  Provides status messages, a progress section
+    for ROM/save transfers, and a final "Done" state with a Close button.
+    """
+
+    _BG      = "#1e1e2e"
+    _FG      = "#cdd6f4"
+    _FG_DIM  = "#6c7086"
+    _ACCENT  = "#89b4fa"
+    _BAR_BG  = "#313244"
+    _BAR_FG  = "#89b4fa"
+    _OK_FG   = "#a6e3a1"
+    _WARN_FG = "#f9e2af"
+    _ERR_FG  = "#f38ba8"
+
+    def __init__(self):
+        root = tk.Tk()
+        root.title("PyGB")
+        root.resizable(False, False)
+        root.configure(bg=self._BG)
+        # Prevent the user from closing mid-operation
+        root.protocol("WM_DELETE_WINDOW", self._noop)
+        self._root = root
+
+        pad_x = 24
+
+        # ── Header ────────────────────────────────────────────────────────
+        tk.Label(root, text="PyGB", font=("Helvetica", 16, "bold"),
+                 bg=self._BG, fg=self._ACCENT).pack(padx=pad_x, pady=(16, 0))
+        tk.Label(root, text="Game Boy Cartridge Player", font=("Helvetica", 9),
+                 bg=self._BG, fg=self._FG_DIM).pack(padx=pad_x, pady=(0, 6))
+
+        ttk.Separator(root, orient="horizontal").pack(fill="x", padx=pad_x, pady=4)
+
+        # ── Status label ──────────────────────────────────────────────────
+        self._status_var = tk.StringVar(value="Starting…")
+        self._status_lbl = tk.Label(
+            root, textvariable=self._status_var,
+            font=("Helvetica", 10), bg=self._BG, fg=self._FG,
+            wraplength=360, justify="left",
+        )
+        self._status_lbl.pack(fill="x", padx=pad_x, pady=(6, 10))
+
+        # ── Progress section (hidden until a transfer starts) ─────────────
+        self._prog_frame = tk.Frame(root, bg=self._BG)
+
+        ttk.Separator(self._prog_frame, orient="horizontal").pack(
+            fill="x", padx=0, pady=(0, 8))
+
+        self._game_var = tk.StringVar(value="")
+        tk.Label(self._prog_frame, textvariable=self._game_var,
+                 font=("Helvetica", 11, "bold"), bg=self._BG, fg=self._FG).pack(
+                     fill="x", padx=4, pady=(0, 2))
+
+        self._op_var = tk.StringVar(value="")
+        tk.Label(self._prog_frame, textvariable=self._op_var,
+                 font=("Helvetica", 9), bg=self._BG, fg=self._FG_DIM).pack(
+                     fill="x", padx=4)
+
+        style = ttk.Style(root)
+        style.theme_use("default")
+        style.configure("PyGB.Horizontal.TProgressbar",
+                        troughcolor=self._BAR_BG, background=self._BAR_FG,
+                        borderwidth=0, thickness=14)
+        self._bar_var = tk.DoubleVar(value=0.0)
+        ttk.Progressbar(
+            self._prog_frame, variable=self._bar_var, maximum=100.0,
+            style="PyGB.Horizontal.TProgressbar", length=360,
+        ).pack(fill="x", padx=4, pady=4)
+
+        self._size_var = tk.StringVar(value="")
+        tk.Label(self._prog_frame, textvariable=self._size_var,
+                 font=("Helvetica", 9), bg=self._BG, fg=self._FG_DIM).pack(
+                     fill="x", padx=4, pady=(0, 10))
+
+        self._prog_visible = False
+        self._xfer_size = 0
+        self._xfer_pos  = 0
+
+        # ── Close button (hidden until done) ──────────────────────────────
+        self._close_btn = tk.Button(
+            root, text="Close", command=root.destroy,
+            bg=self._BAR_BG, fg=self._FG, activebackground=self._ACCENT,
+            activeforeground=self._BG, relief="flat", padx=16, pady=6,
+            cursor="hand2",
+        )
+
+        # Withdraw, measure, centre, then show — avoids the top-left flash
+        # that happens when geometry() is called before tkinter has laid out.
+        root.withdraw()
+        root.update_idletasks()
+        w = max(root.winfo_reqwidth(), 420)
+        h = root.winfo_reqheight()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        root.deiconify()
+        root.update()
+
+    # ------------------------------------------------------------------
+    def _noop(self):
+        pass
+
+    def _pump(self):
+        if self._root.winfo_exists():
+            self._root.update()
+
+    # ------------------------------------------------------------------
+    def set_status(self, msg, kind="info"):
+        colours = {
+            "ok":    self._OK_FG,
+            "warn":  self._WARN_FG,
+            "error": self._ERR_FG,
+        }
+        self._status_var.set(msg)
+        self._status_lbl.configure(fg=colours.get(kind, self._FG))
+        self._pump()
+
+    def show_error_dialog(self, msg):
+        messagebox.showerror("PyGB", msg)
+
+    # ------------------------------------------------------------------
+    def show_progress(self, game_title):
+        """Reveal the progress section and reset its state."""
+        self._game_var.set(game_title)
+        self._op_var.set("")
+        self._bar_var.set(0.0)
+        self._size_var.set("")
+        self._xfer_size = 0
+        self._xfer_pos  = 0
+        if not self._prog_visible:
+            self._prog_frame.pack(fill="x", padx=24, pady=(0, 12))
+            self._prog_visible = True
+        self._root.update_idletasks()
+        self._pump()
+
+    def hide_progress(self):
+        if self._prog_visible:
+            self._prog_frame.pack_forget()
+            self._prog_visible = False
+        self._root.update_idletasks()
+        self._pump()
+
+    def set_progress(self, args):
+        """Handle a FlashGBX TransferData progress callback."""
+        action = args.get("action", "")
+
+        if action == "INITIALIZE":
+            self._xfer_size = args.get("size", 0)
+            self._xfer_pos  = args.get("pos", 0)
+            label = _OP_LABELS.get(args.get("method", ""), args.get("method", ""))
+            self._op_var.set(label)
+            self._bar_var.set(0.0)
+            self._size_var.set("")
+
+        elif action in ("READ", "WRITE"):
+            self._xfer_pos += args.get("bytes_added", 0)
+            self._refresh_bar()
+
+        elif action == "UPDATE_POS":
+            self._xfer_pos = args.get("pos", self._xfer_pos)
+            self._refresh_bar()
+
+        elif action == "FINISHED":
+            self._xfer_pos = self._xfer_size
+            self._refresh_bar()
+            self._op_var.set(self._op_var.get() + " — done")
+
+        elif action == "ABORT":
+            msg = args.get("info_msg", "Aborted.")
+            self._op_var.set(msg)
+            self.set_status(msg, kind="error")
+
+        elif action == "USER_ACTION":
+            msg = args.get("msg", "")
+            if msg:
+                self.set_status(msg, kind="warn")
+
+        self._pump()
+
+    def _refresh_bar(self):
+        if self._xfer_size == 0:
+            return
+        pct = min(self._xfer_pos / self._xfer_size * 100, 100.0)
+        self._bar_var.set(pct)
+        self._size_var.set(
+            f"{format_size(self._xfer_pos)}  /  {format_size(self._xfer_size)}  ({pct:.1f}%)"
+        )
+
+    # ------------------------------------------------------------------
+    def hide(self):
+        """Withdraw the window while the emulator is running."""
+        self._root.withdraw()
+
+    def show(self):
+        """Bring the window back after the emulator exits."""
+        self._root.deiconify()
+        self._root.lift()
+        self._root.attributes("-topmost", True)
+        self._root.after(200, lambda: self._root.attributes("-topmost", False))
+        self._pump()
+
+    # ------------------------------------------------------------------
+    def finish(self, msg="Done!"):
+        """
+        Show a final status message and a Close button, then hand control
+        to the Tk event loop so the user can dismiss the window.
+        """
+        self.hide_progress()
+        self.set_status(msg, kind="ok")
+        self._close_btn.pack(pady=(0, 16))
+        self._root.protocol("WM_DELETE_WINDOW", self._root.destroy)
+        self._root.update_idletasks()
+        self._root.update()
+        self._root.mainloop()
+
+    def destroy(self):
+        if self._root.winfo_exists():
+            self._root.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Progress — GUI window (standalone, used when there IS a terminal)
+# ---------------------------------------------------------------------------
+
+class _StandaloneProgressWindow:
+    """
+    Small progress pop-up shown during ROM dump and save operations when
+    PyGB is running in a terminal (AppWindow is not active).
+    """
+
+    _BG      = "#1e1e2e"
+    _FG      = "#cdd6f4"
+    _FG_DIM  = "#6c7086"
+    _ACCENT  = "#89b4fa"
+    _BAR_BG  = "#313244"
+    _BAR_FG  = "#89b4fa"
+
+    def __init__(self, game_title):
+        root = tk.Tk()
+        root.title("PyGB")
+        root.resizable(False, False)
+        root.configure(bg=self._BG)
+        root.attributes("-topmost", True)
+        self._root = root
+
+        pad = dict(padx=20, pady=6)
+
+        tk.Label(root, text=game_title, font=("Helvetica", 13, "bold"),
+                 bg=self._BG, fg=self._FG).pack(fill="x", padx=20, pady=(16, 2))
+
+        self._op_var = tk.StringVar(value="")
+        tk.Label(root, textvariable=self._op_var, font=("Helvetica", 10),
+                 bg=self._BG, fg=self._FG_DIM).pack(fill="x", **pad)
+
+        style = ttk.Style(root)
+        style.theme_use("default")
+        style.configure("PyGB.Horizontal.TProgressbar",
+                        troughcolor=self._BAR_BG, background=self._BAR_FG,
+                        borderwidth=0, thickness=14)
+        self._bar_var = tk.DoubleVar(value=0.0)
+        ttk.Progressbar(root, variable=self._bar_var, maximum=100.0,
+                        style="PyGB.Horizontal.TProgressbar",
+                        length=340).pack(fill="x", padx=20, pady=4)
+
+        self._size_var = tk.StringVar(value="")
+        tk.Label(root, textvariable=self._size_var, font=("Helvetica", 9),
+                 bg=self._BG, fg=self._FG_DIM).pack(fill="x", padx=20, pady=(2, 16))
+
+        self._size = 0
+        self._pos  = 0
+
+        root.withdraw()
+        root.update_idletasks()
+        w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        root.deiconify()
+        root.update()
+
+    def SetProgress(self, args):
+        action = args.get("action", "")
+
+        if action == "INITIALIZE":
+            self._size = args.get("size", 0)
+            self._pos  = args.get("pos", 0)
+            label = _OP_LABELS.get(args.get("method", ""), args.get("method", ""))
+            self._op_var.set(label)
+            self._bar_var.set(0.0)
+            self._size_var.set("")
+            status(f"{label}...")
+
+        elif action in ("READ", "WRITE"):
+            self._pos += args.get("bytes_added", 0)
+            self._refresh()
+
+        elif action == "UPDATE_POS":
+            self._pos = args.get("pos", self._pos)
+            self._refresh()
+
+        elif action == "FINISHED":
+            self._pos = self._size
+            self._refresh()
+            self._op_var.set(self._op_var.get() + " — done")
+
+        elif action == "ABORT":
+            msg = args.get("info_msg", "Aborted.")
+            self._op_var.set(msg)
+            error(msg)
+
+        elif action == "USER_ACTION":
+            msg = args.get("msg", "")
+            if msg:
+                warn(msg)
+
+        if self._root:
+            self._root.update()
+
+    def _refresh(self):
+        if self._size == 0:
+            return
+        pct = min(self._pos / self._size * 100, 100.0)
+        self._bar_var.set(pct)
+        self._size_var.set(
+            f"{format_size(self._pos)}  /  {format_size(self._size)}  ({pct:.1f}%)"
+        )
+
+    def close(self):
+        if self._root:
+            self._root.destroy()
+            self._root = None
+
+
+# ---------------------------------------------------------------------------
+# ProgressWindow — public interface; delegates to AppWindow or standalone
+# ---------------------------------------------------------------------------
+
+class ProgressWindow:
+    """
+    Unified progress interface.  When an AppWindow is active (GUI mode),
+    delegates to it so no second window is created.  Otherwise opens a
+    standalone pop-up, or falls back to a terminal progress bar.
+    """
+
+    def __init__(self, game_title):
+        global _app_window
+        if _app_window is not None:
+            self._mode = "app"
+            _app_window.show_progress(game_title)
+        elif _TK_AVAILABLE:
+            self._mode = "standalone"
+            self._win = _StandaloneProgressWindow(game_title)
+        else:
+            self._mode = "terminal"
+            self._win = ProgressHandler()
+
+    def SetProgress(self, args):
+        if self._mode == "app":
+            _app_window.set_progress(args)
+            # Mirror INITIALIZE label to the terminal as well
+            if args.get("action") == "INITIALIZE":
+                label = _OP_LABELS.get(args.get("method", ""), args.get("method", ""))
+                status(f"{label}...")
+        else:
+            self._win.SetProgress(args)
+
+    def close(self):
+        if self._mode == "app":
+            _app_window.hide_progress()
+        else:
+            self._win.close()
 
 
 def format_size(n):
@@ -337,7 +844,7 @@ def has_rtc(mode, header):
 # ---------------------------------------------------------------------------
 # ROM cache
 # ---------------------------------------------------------------------------
-ROM_CACHE_DIR = os.path.expanduser("~/.local/share/pygb/roms")
+ROM_CACHE_DIR = os.path.join(_pygb_data_dir(), "roms")
 
 
 def rom_cache_path(safe_title, ext):
@@ -585,7 +1092,7 @@ def write_save(dev, mode, header, save_path, progress):
 # ---------------------------------------------------------------------------
 # PyGB config file  (~/.config/pygb/pygb.ini)
 # ---------------------------------------------------------------------------
-PYGB_CONFIG_DIR = os.path.expanduser("~/.config/pygb")
+PYGB_CONFIG_DIR  = _pygb_config_dir()
 PYGB_CONFIG_FILE = os.path.join(PYGB_CONFIG_DIR, "pygb.ini")
 
 
@@ -621,13 +1128,7 @@ def set_cheevos_credentials(cfg, username, password):
 # ---------------------------------------------------------------------------
 def find_emulator():
     """Find an available emulator on the system."""
-    candidates = [
-        "retroarch",
-        "mgba-qt",
-        "mgba",
-        "gambatte-qt",
-        "sameboy",
-    ]
+    candidates = ["retroarch", "mgba-qt", "mgba", "gambatte-qt", "sameboy"]
     for name in candidates:
         path = shutil.which(name)
         if path:
@@ -637,17 +1138,15 @@ def find_emulator():
 
 def find_retroarch_core(mode):
     """Find a suitable RetroArch core for the given cart mode."""
-    core_names = ["mgba_libretro", "vba_next_libretro", "vbam_libretro"] if mode == "AGB" else ["sameboy_libretro", "gambatte_libretro", "mgba_libretro"]
-    search_dirs = [
-        "/usr/lib/libretro",
-        "/usr/lib64/libretro",
-        "/usr/local/lib/libretro",
-        os.path.expanduser("~/.config/retroarch/cores"),
-        os.path.expanduser("~/.local/share/retroarch/cores"),
-    ]
+    core_names = (
+        ["mgba_libretro", "vba_next_libretro", "vbam_libretro"]
+        if mode == "AGB"
+        else ["sameboy_libretro", "gambatte_libretro", "mgba_libretro"]
+    )
+    ext = _core_ext()
     for core in core_names:
-        for d in search_dirs:
-            p = os.path.join(d, core + ".so")
+        for d in _retroarch_core_dirs():
+            p = os.path.join(d, core + ext)
             if os.path.exists(p):
                 return p
     return None
@@ -704,27 +1203,22 @@ def build_emulator_cmd(emulator, rom_path, mode, cheevos=None):
 
 def _retroarch_saves_dir():
     """Return RetroArch's default saves directory."""
-    return os.path.expanduser("~/.config/retroarch/saves")
+    return os.path.join(_retroarch_config_dir(), "saves")
 
 
 def _core_subdir(core_path):
     """
     Return the core's save subdirectory name by reading its .info file.
     RetroArch organises saves as <saves_dir>/<CoreName>/<game>.srm when
-    sort_savefiles_enable is on.  The corename comes from the .info file
-    that lives alongside the core .so, or in /usr/share/libretro/info/.
+    sort_savefiles_enable is on.
     Returns None if the info file cannot be found or parsed.
     """
     if not core_path:
         return None
 
-    core_stem = os.path.splitext(os.path.basename(core_path))[0]  # e.g. sameboy_libretro
-    info_search = [
-        os.path.join(os.path.dirname(core_path), core_stem + ".info"),
-        f"/usr/share/libretro/info/{core_stem}.info",
-        f"/usr/local/share/libretro/info/{core_stem}.info",
-    ]
-    for info_path in info_search:
+    core_stem = os.path.splitext(os.path.basename(core_path))[0]
+    for info_dir in _retroarch_info_dirs(core_path):
+        info_path = os.path.join(info_dir, core_stem + ".info")
         try:
             with open(info_path) as f:
                 for line in f:
@@ -863,12 +1357,18 @@ def launch_emulator(emulator, rom_path, save_path, mode, rom_base, work_dir, che
     # Pre-place the existing save where the emulator expects it
     placed = pre_place_save(save_path, rom_base, work_dir, core_subdir)
 
+    # Hide the PyGB window while the emulator is running
+    if _app_window is not None:
+        _app_window.hide()
+
     try:
         subprocess.run(cmd)
     except KeyboardInterrupt:
         warn("Emulator interrupted.")
     except Exception as e:
         error(f"Failed to launch emulator: {e}")
+        if _app_window is not None:
+            _app_window.show()
         return False
     finally:
         for f in tmp_files:
@@ -877,6 +1377,10 @@ def launch_emulator(emulator, rom_path, save_path, mode, rom_base, work_dir, che
             except OSError:
                 pass
 
+    # Bring the PyGB window back for save writeback
+    if _app_window is not None:
+        _app_window.show()
+
     return collect_save(save_path, rom_base, work_dir, placed, core_subdir)
 
 
@@ -884,6 +1388,8 @@ def launch_emulator(emulator, rom_path, save_path, mode, rom_base, work_dir, che
 # Main flow
 # ---------------------------------------------------------------------------
 def main():
+    global _app_window
+
     parser = argparse.ArgumentParser(
         description="PyGB - Play Game Boy / GBA cartridges via GBxCart RW",
     )
@@ -942,7 +1448,18 @@ def main():
         action="store_true",
         help="Disable RetroAchievements for this session",
     )
+    parser.add_argument(
+        "--no-gui",
+        action="store_true",
+        help="Disable the GUI status window (terminal output only)",
+    )
     args = parser.parse_args()
+
+    # Show a persistent GUI window whenever tkinter is available, unless the
+    # user explicitly opted out.  This works whether launched from a file
+    # manager (no terminal) or a normal terminal session.
+    if _TK_AVAILABLE and not args.no_gui:
+        _app_window = AppWindow()
 
     print(f"\n{BOLD}PyGB - GBxCart Play Cart{RESET}")
     print(f"{'=' * 40}\n")
@@ -967,50 +1484,46 @@ def main():
     # Step 1: Find emulator
     emulator = args.emulator or find_emulator()
     if not emulator:
-        error("No emulator found. Install RetroArch, mGBA, or pass --emulator.")
-        sys.exit(1)
+        fatal("No emulator found. Install RetroArch, mGBA, or pass --emulator.")
     status(f"Emulator: {emulator}")
 
     # Step 2: Connect to GBxCart RW
-    status("Searching for GBxCart RW device...")
+    status("Searching for GBxCart RW device…")
     dev = connect_device(port=args.port)
     if dev is None:
-        error(
+        fatal(
             "No GBxCart RW device found.\n"
             "  - Is the device plugged in?\n"
             "  - Do you have permission to access the serial port?\n"
             "    (try: sudo usermod -aG dialout $USER)"
         )
-        sys.exit(1)
     success(f"Connected to {dev.GetFullNameExtended()}")
 
     dev.SetAutoPowerOff(300000)  # 5 minutes idle auto-off
     dev.SetAGBReadMethod(2)      # Stream read for AGB (fastest)
 
+    # Use a plain terminal handler until we know the game title
     progress = ProgressHandler()
 
     # Step 3: Detect cartridge mode and read header
     if args.mode == "auto":
-        status("Auto-detecting cartridge type...")
+        status("Auto-detecting cartridge type…")
         mode, header = detect_mode(dev)
         if mode is None:
-            error(
+            fatal(
                 "No cartridge detected.\n"
                 "  - Is a cartridge inserted?\n"
                 "  - Are the contacts clean?\n"
-                "  - Try specifying --mode dmg or --mode agb."
+                "  - Try specifying --mode dmg or --mode agb.",
+                dev=dev,
             )
-            dev.Close(cartPowerOff=True)
-            sys.exit(1)
     else:
         mode = args.mode.upper()
         dev.SetMode(mode)
         time.sleep(0.2)
         header = dev.ReadInfo()
         if header is False or header == {} or header.get("empty_nocart", True):
-            error("No cartridge detected in the selected mode.")
-            dev.Close(cartPowerOff=True)
-            sys.exit(1)
+            fatal("No cartridge detected in the selected mode.", dev=dev)
 
     mode_name = "Game Boy" if mode == "DMG" else "Game Boy Advance"
     game_title = header.get("game_title", "UNKNOWN").strip()
@@ -1040,6 +1553,8 @@ def main():
     rom_path = os.path.join(work_dir, rom_base + ext)
     save_path = os.path.join(work_dir, rom_base + ".sav")
 
+    # Now that we have the game title, switch to the GUI progress window
+    progress = ProgressWindow(game_title)
     print()
 
     # Step 5: Use cached ROM if valid, otherwise dump from cartridge
@@ -1048,31 +1563,33 @@ def main():
         shutil.copy2(cached, rom_path)
     else:
         if not dump_rom(dev, mode, header, rom_path, progress):
-            error("Failed to dump ROM. Aborting.")
-            dev.Close(cartPowerOff=True)
-            sys.exit(1)
+            progress.close()
+            fatal("Failed to dump ROM. Aborting.", dev=dev)
 
     # Step 6: Dump save data
     has_save = dump_save(dev, mode, header, save_path, progress)
 
-    # Power off cart during emulation
+    # Done with hardware — close the progress section before launching emulator
+    progress.close()
     dev.CartPowerOff()
     print()
 
     # Step 7: Launch emulator
-    status(f"Starting {game_title}...")
+    status(f"Starting {game_title}…")
     save_found = launch_emulator(emulator, rom_path, save_path, mode, rom_base, work_dir, cheevos)
 
     print()
 
     # Step 8: Write save back to cartridge
     if has_save and save_found and not args.no_writeback:
-        status("Preparing to write save back to cartridge...")
+        status("Preparing to write save back to cartridge…")
         dev.SetMode(mode)
         time.sleep(0.3)
         check_header = dev.ReadInfo()
         if check_header and not check_header.get("empty_nocart", True):
+            progress = ProgressWindow(game_title)
             write_save(dev, mode, header, save_path, progress)
+            progress.close()
         else:
             error("Cartridge no longer detected. Cannot write save back.")
             error(f"Your save file is preserved at: {save_path}")
@@ -1095,7 +1612,12 @@ def main():
         except Exception:
             warn(f"Could not clean up temp files at: {work_dir}")
 
-    print(f"\n{GREEN}Done!{RESET}\n")
+    # In GUI mode, show a final "Done" state and wait for the user to close
+    # the window; in terminal mode, just print and exit.
+    if _app_window is not None:
+        _app_window.finish("Done! Safe to close this window.")
+    else:
+        print(f"\n{GREEN}Done!{RESET}\n")
 
 
 if __name__ == "__main__":
