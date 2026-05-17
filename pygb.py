@@ -11,7 +11,6 @@ import sys
 import os
 import platform
 import time
-import copy
 import shutil
 import struct
 import tempfile
@@ -149,6 +148,17 @@ except ImportError:
 # Persistent application window (set in main() when running without a terminal)
 _app_window = None
 
+# Catppuccin Mocha palette shared by all GUI windows
+_C_BG      = "#1e1e2e"
+_C_FG      = "#cdd6f4"
+_C_FG_DIM  = "#6c7086"
+_C_ACCENT  = "#89b4fa"
+_C_BAR_BG  = "#313244"
+_C_BAR_FG  = "#89b4fa"
+_C_OK      = "#a6e3a1"
+_C_WARN    = "#f9e2af"
+_C_ERR     = "#f38ba8"
+
 # ---------------------------------------------------------------------------
 # Logging helpers — write to terminal and/or GUI status label
 # ---------------------------------------------------------------------------
@@ -247,6 +257,26 @@ class ProgressHandler:
 
 
 # ---------------------------------------------------------------------------
+# GUI helpers shared by AppWindow and _StandaloneProgressWindow
+# ---------------------------------------------------------------------------
+
+def _configure_progressbar_style(root):
+    style = ttk.Style(root)
+    style.theme_use("default")
+    style.configure("PyGB.Horizontal.TProgressbar",
+                    troughcolor=_C_BAR_BG, background=_C_BAR_FG,
+                    borderwidth=0, thickness=14)
+
+
+def _update_bar(pos, size, bar_var, size_var):
+    if size == 0:
+        return
+    pct = min(pos / size * 100, 100.0)
+    bar_var.set(pct)
+    size_var.set(f"{format_size(pos)}  /  {format_size(size)}  ({pct:.1f}%)")
+
+
+# ---------------------------------------------------------------------------
 # AppWindow — persistent GUI window shown throughout the entire run
 # ---------------------------------------------------------------------------
 
@@ -257,32 +287,21 @@ class AppWindow:
     for ROM/save transfers, and a final "Done" state with a Close button.
     """
 
-    _BG      = "#1e1e2e"
-    _FG      = "#cdd6f4"
-    _FG_DIM  = "#6c7086"
-    _ACCENT  = "#89b4fa"
-    _BAR_BG  = "#313244"
-    _BAR_FG  = "#89b4fa"
-    _OK_FG   = "#a6e3a1"
-    _WARN_FG = "#f9e2af"
-    _ERR_FG  = "#f38ba8"
-
     def __init__(self):
         root = tk.Tk()
         root.title("PyGB")
         root.resizable(False, False)
-        root.configure(bg=self._BG)
-        # Prevent the user from closing mid-operation
-        root.protocol("WM_DELETE_WINDOW", self._noop)
+        root.configure(bg=_C_BG)
+        root.protocol("WM_DELETE_WINDOW", lambda: None)
         self._root = root
 
         pad_x = 24
 
         # ── Header ────────────────────────────────────────────────────────
         tk.Label(root, text="PyGB", font=("Helvetica", 16, "bold"),
-                 bg=self._BG, fg=self._ACCENT).pack(padx=pad_x, pady=(16, 0))
+                 bg=_C_BG, fg=_C_ACCENT).pack(padx=pad_x, pady=(16, 0))
         tk.Label(root, text="Game Boy Cartridge Player", font=("Helvetica", 9),
-                 bg=self._BG, fg=self._FG_DIM).pack(padx=pad_x, pady=(0, 6))
+                 bg=_C_BG, fg=_C_FG_DIM).pack(padx=pad_x, pady=(0, 6))
 
         ttk.Separator(root, orient="horizontal").pack(fill="x", padx=pad_x, pady=4)
 
@@ -290,32 +309,28 @@ class AppWindow:
         self._status_var = tk.StringVar(value="Starting…")
         self._status_lbl = tk.Label(
             root, textvariable=self._status_var,
-            font=("Helvetica", 10), bg=self._BG, fg=self._FG,
+            font=("Helvetica", 10), bg=_C_BG, fg=_C_FG,
             wraplength=360, justify="left",
         )
         self._status_lbl.pack(fill="x", padx=pad_x, pady=(6, 10))
 
         # ── Progress section (hidden until a transfer starts) ─────────────
-        self._prog_frame = tk.Frame(root, bg=self._BG)
+        self._prog_frame = tk.Frame(root, bg=_C_BG)
 
         ttk.Separator(self._prog_frame, orient="horizontal").pack(
             fill="x", padx=0, pady=(0, 8))
 
         self._game_var = tk.StringVar(value="")
         tk.Label(self._prog_frame, textvariable=self._game_var,
-                 font=("Helvetica", 11, "bold"), bg=self._BG, fg=self._FG).pack(
+                 font=("Helvetica", 11, "bold"), bg=_C_BG, fg=_C_FG).pack(
                      fill="x", padx=4, pady=(0, 2))
 
         self._op_var = tk.StringVar(value="")
         tk.Label(self._prog_frame, textvariable=self._op_var,
-                 font=("Helvetica", 9), bg=self._BG, fg=self._FG_DIM).pack(
+                 font=("Helvetica", 9), bg=_C_BG, fg=_C_FG_DIM).pack(
                      fill="x", padx=4)
 
-        style = ttk.Style(root)
-        style.theme_use("default")
-        style.configure("PyGB.Horizontal.TProgressbar",
-                        troughcolor=self._BAR_BG, background=self._BAR_FG,
-                        borderwidth=0, thickness=14)
+        _configure_progressbar_style(root)
         self._bar_var = tk.DoubleVar(value=0.0)
         ttk.Progressbar(
             self._prog_frame, variable=self._bar_var, maximum=100.0,
@@ -324,18 +339,17 @@ class AppWindow:
 
         self._size_var = tk.StringVar(value="")
         tk.Label(self._prog_frame, textvariable=self._size_var,
-                 font=("Helvetica", 9), bg=self._BG, fg=self._FG_DIM).pack(
+                 font=("Helvetica", 9), bg=_C_BG, fg=_C_FG_DIM).pack(
                      fill="x", padx=4, pady=(0, 10))
 
-        self._prog_visible = False
         self._xfer_size = 0
         self._xfer_pos  = 0
 
         # ── Close button (hidden until done) ──────────────────────────────
         self._close_btn = tk.Button(
             root, text="Close", command=root.destroy,
-            bg=self._BAR_BG, fg=self._FG, activebackground=self._ACCENT,
-            activeforeground=self._BG, relief="flat", padx=16, pady=6,
+            bg=_C_BAR_BG, fg=_C_FG, activebackground=_C_ACCENT,
+            activeforeground=_C_BG, relief="flat", padx=16, pady=6,
             cursor="hand2",
         )
 
@@ -351,9 +365,6 @@ class AppWindow:
         root.update()
 
     # ------------------------------------------------------------------
-    def _noop(self):
-        pass
-
     def _pump(self):
         if self._root.winfo_exists():
             self._root.update()
@@ -361,12 +372,12 @@ class AppWindow:
     # ------------------------------------------------------------------
     def set_status(self, msg, kind="info"):
         colours = {
-            "ok":    self._OK_FG,
-            "warn":  self._WARN_FG,
-            "error": self._ERR_FG,
+            "ok":    _C_OK,
+            "warn":  _C_WARN,
+            "error": _C_ERR,
         }
         self._status_var.set(msg)
-        self._status_lbl.configure(fg=colours.get(kind, self._FG))
+        self._status_lbl.configure(fg=colours.get(kind, _C_FG))
         self._pump()
 
     def show_error_dialog(self, msg):
@@ -381,16 +392,14 @@ class AppWindow:
         self._size_var.set("")
         self._xfer_size = 0
         self._xfer_pos  = 0
-        if not self._prog_visible:
+        if not self._prog_frame.winfo_manager():
             self._prog_frame.pack(fill="x", padx=24, pady=(0, 12))
-            self._prog_visible = True
         self._root.update_idletasks()
         self._pump()
 
     def hide_progress(self):
-        if self._prog_visible:
+        if self._prog_frame.winfo_manager():
             self._prog_frame.pack_forget()
-            self._prog_visible = False
         self._root.update_idletasks()
         self._pump()
 
@@ -432,13 +441,7 @@ class AppWindow:
         self._pump()
 
     def _refresh_bar(self):
-        if self._xfer_size == 0:
-            return
-        pct = min(self._xfer_pos / self._xfer_size * 100, 100.0)
-        self._bar_var.set(pct)
-        self._size_var.set(
-            f"{format_size(self._xfer_pos)}  /  {format_size(self._xfer_size)}  ({pct:.1f}%)"
-        )
+        _update_bar(self._xfer_pos, self._xfer_size, self._bar_var, self._size_var)
 
     # ------------------------------------------------------------------
     def hide(self):
@@ -482,35 +485,24 @@ class _StandaloneProgressWindow:
     PyGB is running in a terminal (AppWindow is not active).
     """
 
-    _BG      = "#1e1e2e"
-    _FG      = "#cdd6f4"
-    _FG_DIM  = "#6c7086"
-    _ACCENT  = "#89b4fa"
-    _BAR_BG  = "#313244"
-    _BAR_FG  = "#89b4fa"
-
     def __init__(self, game_title):
         root = tk.Tk()
         root.title("PyGB")
         root.resizable(False, False)
-        root.configure(bg=self._BG)
+        root.configure(bg=_C_BG)
         root.attributes("-topmost", True)
         self._root = root
 
         pad = dict(padx=20, pady=6)
 
         tk.Label(root, text=game_title, font=("Helvetica", 13, "bold"),
-                 bg=self._BG, fg=self._FG).pack(fill="x", padx=20, pady=(16, 2))
+                 bg=_C_BG, fg=_C_FG).pack(fill="x", padx=20, pady=(16, 2))
 
         self._op_var = tk.StringVar(value="")
         tk.Label(root, textvariable=self._op_var, font=("Helvetica", 10),
-                 bg=self._BG, fg=self._FG_DIM).pack(fill="x", **pad)
+                 bg=_C_BG, fg=_C_FG_DIM).pack(fill="x", **pad)
 
-        style = ttk.Style(root)
-        style.theme_use("default")
-        style.configure("PyGB.Horizontal.TProgressbar",
-                        troughcolor=self._BAR_BG, background=self._BAR_FG,
-                        borderwidth=0, thickness=14)
+        _configure_progressbar_style(root)
         self._bar_var = tk.DoubleVar(value=0.0)
         ttk.Progressbar(root, variable=self._bar_var, maximum=100.0,
                         style="PyGB.Horizontal.TProgressbar",
@@ -518,7 +510,7 @@ class _StandaloneProgressWindow:
 
         self._size_var = tk.StringVar(value="")
         tk.Label(root, textvariable=self._size_var, font=("Helvetica", 9),
-                 bg=self._BG, fg=self._FG_DIM).pack(fill="x", padx=20, pady=(2, 16))
+                 bg=_C_BG, fg=_C_FG_DIM).pack(fill="x", padx=20, pady=(2, 16))
 
         self._size = 0
         self._pos  = 0
@@ -570,18 +562,131 @@ class _StandaloneProgressWindow:
             self._root.update()
 
     def _refresh(self):
-        if self._size == 0:
-            return
-        pct = min(self._pos / self._size * 100, 100.0)
-        self._bar_var.set(pct)
-        self._size_var.set(
-            f"{format_size(self._pos)}  /  {format_size(self._size)}  ({pct:.1f}%)"
-        )
+        _update_bar(self._pos, self._size, self._bar_var, self._size_var)
 
     def close(self):
         if self._root:
             self._root.destroy()
             self._root = None
+
+
+# ---------------------------------------------------------------------------
+# LibraryWindow — browse and launch cached ROMs
+# ---------------------------------------------------------------------------
+
+class LibraryWindow:
+    """
+    Modal window listing all ROMs in ROM_CACHE_DIR.  Returns the selected
+    ROM dict via ask(), or None if the user cancelled.
+    """
+
+    def __init__(self, roms):
+        self._selected = None
+        self._roms = roms
+
+        # Reuse the existing Tk root if AppWindow is active; a second Tk()
+        # alongside an already-constructed one causes event loop conflicts.
+        if _app_window is not None:
+            root = tk.Toplevel(_app_window._root)
+            root.grab_set()
+        else:
+            root = tk.Tk()
+        root.title("ROM Library")
+        root.resizable(True, True)
+        root.configure(bg=_C_BG)
+        root.minsize(520, 300)
+        root.protocol("WM_DELETE_WINDOW", root.destroy)
+        self._root = root
+
+        pad_x = 24
+
+        tk.Label(root, text="ROM Library", font=("Helvetica", 14, "bold"),
+                 bg=_C_BG, fg=_C_ACCENT).pack(padx=pad_x, pady=(16, 0))
+        count = len(roms)
+        tk.Label(root, text=f"{count} game{'s' if count != 1 else ''} cached",
+                 font=("Helvetica", 9), bg=_C_BG, fg=_C_FG_DIM).pack(padx=pad_x, pady=(0, 6))
+        ttk.Separator(root, orient="horizontal").pack(fill="x", padx=pad_x, pady=4)
+
+        # Style the Treeview
+        style = ttk.Style(root)
+        style.theme_use("default")
+        style.configure("Library.Treeview",
+                        background=_C_BG, foreground=_C_FG,
+                        fieldbackground=_C_BG, borderwidth=0, rowheight=28,
+                        font=("Helvetica", 10))
+        style.configure("Library.Treeview.Heading",
+                        background=_C_BAR_BG, foreground=_C_FG,
+                        relief="flat", font=("Helvetica", 9, "bold"))
+        style.map("Library.Treeview",
+                  background=[("selected", _C_ACCENT)],
+                  foreground=[("selected", _C_BG)])
+
+        frame = tk.Frame(root, bg=_C_BG)
+        frame.pack(fill="both", expand=True, padx=pad_x, pady=(4, 0))
+
+        tree = ttk.Treeview(frame, columns=("title", "system", "size"),
+                             show="headings", style="Library.Treeview",
+                             selectmode="browse")
+        tree.heading("title",  text="Title")
+        tree.heading("system", text="System")
+        tree.heading("size",   text="Size")
+        tree.column("title",  width=300, stretch=True)
+        tree.column("system", width=80,  stretch=False, anchor="center")
+        tree.column("size",   width=80,  stretch=False, anchor="e")
+
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        for i, rom in enumerate(roms):
+            system = "GBA" if rom["mode"] == "AGB" else "GB/GBC"
+            tree.insert("", "end", iid=str(i),
+                        values=(rom["title"], system, format_size(rom["size"])))
+
+        tree.bind("<Double-1>", self._on_play)
+        self._tree = tree
+
+        btn_frame = tk.Frame(root, bg=_C_BG)
+        btn_frame.pack(fill="x", padx=pad_x, pady=12)
+
+        tk.Button(btn_frame, text="Play", command=self._on_play,
+                  bg=_C_ACCENT, fg=_C_BG, activebackground=_C_FG,
+                  activeforeground=_C_BG, relief="flat", padx=16, pady=6,
+                  cursor="hand2").pack(side="right")
+        tk.Button(btn_frame, text="Cancel", command=root.destroy,
+                  bg=_C_BAR_BG, fg=_C_FG, activebackground=_C_BAR_BG,
+                  activeforeground=_C_FG, relief="flat", padx=16, pady=6,
+                  cursor="hand2").pack(side="right", padx=(0, 8))
+
+        root.update_idletasks()
+        w = max(root.winfo_reqwidth(), 520)
+        h = max(root.winfo_reqheight(), 340)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    def _on_play(self, _event=None):
+        sel = self._tree.selection()
+        if not sel:
+            return
+        self._selected = self._roms[int(sel[0])]
+        self._root.destroy()
+
+    @classmethod
+    def ask(cls, roms):
+        """Open the library window and return the chosen ROM dict, or None."""
+        win = cls(roms)
+        if isinstance(win._root, tk.Toplevel):
+            # No separate mainloop — pump the parent Tk root until this window closes.
+            parent = win._root.master
+            while win._root.winfo_exists():
+                try:
+                    parent.update()
+                except tk.TclError:
+                    break
+        else:
+            win._root.mainloop()
+        return win._selected
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +701,6 @@ class ProgressWindow:
     """
 
     def __init__(self, game_title):
-        global _app_window
         if _app_window is not None:
             self._mode = "app"
             _app_window.show_progress(game_title)
@@ -841,14 +945,58 @@ def has_rtc(mode, header):
     return False  # AGB RTC is handled separately by FlashGBX GPIO detection
 
 
+def _rtc_path(save_path):
+    return os.path.splitext(save_path)[0] + ".rtc"
+
+
 # ---------------------------------------------------------------------------
 # ROM cache
 # ---------------------------------------------------------------------------
-ROM_CACHE_DIR = os.path.join(_pygb_data_dir(), "roms")
+ROM_CACHE_DIR  = os.path.join(_pygb_data_dir(), "roms")
+SAVE_CACHE_DIR = os.path.join(_pygb_data_dir(), "saves")
 
 
 def rom_cache_path(safe_title, ext):
     return os.path.join(ROM_CACHE_DIR, safe_title + ext)
+
+
+def read_rom_title(path):
+    """Read the game title string embedded in a ROM file's header."""
+    try:
+        with open(path, "rb") as f:
+            if path.lower().endswith(".gba"):
+                f.seek(0xA0)
+                raw = f.read(12)
+            else:
+                f.seek(0x134)
+                raw = f.read(16)
+        return raw.rstrip(b"\x00").decode("ascii", errors="replace").strip() or None
+    except OSError:
+        return None
+
+
+def list_cached_roms():
+    """Return a list of dicts describing ROMs in ROM_CACHE_DIR, sorted by title."""
+    if not os.path.isdir(ROM_CACHE_DIR):
+        return []
+    result = []
+    for name in os.listdir(ROM_CACHE_DIR):
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in (".gb", ".gbc", ".gba"):
+            continue
+        path = os.path.join(ROM_CACHE_DIR, name)
+        safe_title = os.path.splitext(name)[0]
+        mode = "AGB" if ext == ".gba" else "DMG"
+        title = read_rom_title(path) or safe_title
+        result.append({
+            "path": path,
+            "title": title,
+            "mode": mode,
+            "size": os.path.getsize(path),
+            "safe_title": safe_title,
+        })
+    result.sort(key=lambda r: r["title"].upper())
+    return result
 
 
 def cart_checksum(mode, header):
@@ -872,13 +1020,10 @@ def cart_checksum(mode, header):
 
 def file_checksum_dmg(path):
     """Compute the DMG global ROM checksum over a file (skips bytes 0x14E–0x14F)."""
-    total = 0
     with open(path, "rb") as f:
         data = f.read()
-    for i, b in enumerate(data):
-        if i not in (0x14E, 0x14F):
-            total += b
-    return total & 0xFFFF
+    mv = memoryview(data)
+    return (sum(mv[:0x14E]) + sum(mv[0x150:])) & 0xFFFF
 
 
 def file_checksum_agb(path):
@@ -1004,13 +1149,16 @@ def dump_save(dev, mode, header, save_path, progress):
     # Split them out: keep save_path as pure SRAM, write a companion .rtc file
     # in SameBoy format so SameBoy libretro picks it up correctly.
     if cart_has_rtc:
-        raw = open(save_path, "rb").read()
+        with open(save_path, "rb") as f:
+            raw = f.read()
         if len(raw) == save_size + MBC3_VBA_RTC_SIZE:
             sram_data = raw[:save_size]
             vba_rtc   = raw[save_size:]
-            rtc_path  = os.path.splitext(save_path)[0] + ".rtc"
-            open(save_path, "wb").write(sram_data)
-            open(rtc_path,  "wb").write(vba_to_sameboy_rtc(vba_rtc))
+            rtc_path  = _rtc_path(save_path)
+            with open(save_path, "wb") as f:
+                f.write(sram_data)
+            with open(rtc_path, "wb") as f:
+                f.write(vba_to_sameboy_rtc(vba_rtc))
             success(f"Save data read: {format_size(save_size)} + RTC")
         else:
             warn("RTC data size mismatch in dump; RTC not saved.")
@@ -1038,15 +1186,17 @@ def write_save(dev, mode, header, save_path, progress):
         return False
 
     cart_has_rtc = has_rtc(mode, header)
-    rtc_path = os.path.splitext(save_path)[0] + ".rtc"
+    rtc_path = _rtc_path(save_path)
     write_path = save_path  # FlashGBX reads from this file
 
     # If RTC data is available, build a temporary combined SRAM+VBA_RTC file
     # that FlashGBX expects when rtc=True.
     tmp_combined = None
     if cart_has_rtc and os.path.exists(rtc_path):
-        sram_data = open(save_path, "rb").read()
-        sb_rtc    = open(rtc_path,  "rb").read()
+        with open(save_path, "rb") as f:
+            sram_data = f.read()
+        with open(rtc_path, "rb") as f:
+            sb_rtc = f.read()
         if len(sb_rtc) >= SAMEBOY_RTC_SIZE:
             vba_rtc = sameboy_to_vba_rtc(sb_rtc[:SAMEBOY_RTC_SIZE])
             fd, tmp_combined = tempfile.mkstemp(suffix=".sav")
@@ -1257,7 +1407,7 @@ def pre_place_save(save_path, rom_base, work_dir, core_subdir=None):
     if not os.path.exists(save_path):
         return []
 
-    rtc_src = os.path.splitext(save_path)[0] + ".rtc"
+    rtc_src = _rtc_path(save_path)
     has_rtc_file = os.path.exists(rtc_src)
 
     placed = []
@@ -1274,7 +1424,7 @@ def pre_place_save(save_path, rom_base, work_dir, core_subdir=None):
 
         # Place matching .rtc next to each .srm/.sav we just wrote
         if has_rtc_file:
-            rtc_dst = os.path.splitext(dst)[0] + ".rtc"
+            rtc_dst = _rtc_path(dst)
             try:
                 os.makedirs(os.path.dirname(rtc_dst), exist_ok=True)
                 shutil.copy2(rtc_src, rtc_dst)
@@ -1291,14 +1441,7 @@ def collect_save(save_path, rom_base, work_dir, placed_paths, core_subdir=None):
     Returns True if a valid save was found.
     """
     candidates = list(placed_paths) + _save_candidates(rom_base, work_dir, core_subdir) + [save_path]
-
-    # Deduplicate while preserving order
-    seen = set()
-    unique = []
-    for p in candidates:
-        if p not in seen:
-            seen.add(p)
-            unique.append(p)
+    unique = list(dict.fromkeys(candidates))
 
     best_path = None
     best_mtime = -1
@@ -1320,8 +1463,8 @@ def collect_save(save_path, rom_base, work_dir, placed_paths, core_subdir=None):
         shutil.copy2(best_path, save_path)
 
     # Collect the companion .rtc file from the same directory as the best save
-    rtc_dst = os.path.splitext(save_path)[0] + ".rtc"
-    rtc_src = os.path.splitext(best_path)[0] + ".rtc"
+    rtc_dst = _rtc_path(save_path)
+    rtc_src = _rtc_path(best_path)
     if rtc_src != rtc_dst and os.path.exists(rtc_src):
         shutil.copy2(rtc_src, rtc_dst)
     elif not os.path.exists(rtc_src):
@@ -1329,7 +1472,7 @@ def collect_save(save_path, rom_base, work_dir, placed_paths, core_subdir=None):
         rtc_best = None
         rtc_mtime = -1
         for p in unique:
-            candidate_rtc = os.path.splitext(p)[0] + ".rtc"
+            candidate_rtc = _rtc_path(p)
             try:
                 mt = os.path.getmtime(candidate_rtc)
                 if mt > rtc_mtime:
@@ -1382,6 +1525,55 @@ def launch_emulator(emulator, rom_path, save_path, mode, rom_base, work_dir, che
         _app_window.show()
 
     return collect_save(save_path, rom_base, work_dir, placed, core_subdir)
+
+
+# ---------------------------------------------------------------------------
+# Library launch — play a cached ROM without a cartridge
+# ---------------------------------------------------------------------------
+
+def launch_from_library(emulator, cheevos, args):
+    """Open the ROM library, let the user pick a game, and launch it."""
+    roms = list_cached_roms()
+    if not roms:
+        fatal("ROM library is empty. Insert a cartridge and run PyGB once to cache its ROM.")
+        return
+
+    if _app_window is not None:
+        _app_window.set_status("Opening ROM library…")
+
+    rom = LibraryWindow.ask(roms)
+    if rom is None:
+        return
+
+    mode       = rom["mode"]
+    safe_title = rom["safe_title"]
+    rom_path   = rom["path"]
+
+    os.makedirs(SAVE_CACHE_DIR, exist_ok=True)
+    save_path = os.path.join(SAVE_CACHE_DIR, safe_title + ".sav")
+
+    if args.output_dir:
+        work_dir = args.output_dir
+        os.makedirs(work_dir, exist_ok=True)
+    else:
+        work_dir = tempfile.mkdtemp(prefix=f"pygb_{safe_title}_")
+
+    status(f"Launching from library: {rom['title']} ({mode})")
+    if _app_window is not None:
+        _app_window.set_status(f"Starting {rom['title']}…")
+
+    launch_emulator(emulator, rom_path, save_path, mode, safe_title, work_dir, cheevos)
+
+    if not (args.keep_files or args.output_dir):
+        try:
+            shutil.rmtree(work_dir)
+        except Exception:
+            pass
+
+    if _app_window is not None:
+        _app_window.finish("Done! Safe to close this window.")
+    else:
+        print(f"\n{GREEN}Done!{RESET}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1453,6 +1645,11 @@ def main():
         action="store_true",
         help="Disable the GUI status window (terminal output only)",
     )
+    parser.add_argument(
+        "--library", "-l",
+        action="store_true",
+        help="Browse cached ROMs and launch one without a cartridge",
+    )
     args = parser.parse_args()
 
     # Show a persistent GUI window whenever tkinter is available, unless the
@@ -1486,6 +1683,10 @@ def main():
     if not emulator:
         fatal("No emulator found. Install RetroArch, mGBA, or pass --emulator.")
     status(f"Emulator: {emulator}")
+
+    if args.library:
+        launch_from_library(emulator, cheevos, args)
+        return
 
     # Step 2: Connect to GBxCart RW
     status("Searching for GBxCart RW device…")
@@ -1551,7 +1752,11 @@ def main():
     ext = get_rom_extension(mode, header)
     rom_base = safe_title
     rom_path = os.path.join(work_dir, rom_base + ext)
-    save_path = os.path.join(work_dir, rom_base + ".sav")
+    if args.output_dir:
+        save_path = os.path.join(work_dir, rom_base + ".sav")
+    else:
+        os.makedirs(SAVE_CACHE_DIR, exist_ok=True)
+        save_path = os.path.join(SAVE_CACHE_DIR, rom_base + ".sav")
 
     # Now that we have the game title, switch to the GUI progress window
     progress = ProgressWindow(game_title)
