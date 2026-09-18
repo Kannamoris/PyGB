@@ -119,7 +119,12 @@ def _pygb_config_dir():
 # ---------------------------------------------------------------------------
 # FlashGBX integration
 # ---------------------------------------------------------------------------
-from FlashGBX import Util
+# FlashGBX 5.0 split the old monolithic Util module into app/CartridgeTypes/Mapper,
+# so everything below comes from those modules now.
+from FlashGBX import app as fgbx_app
+from FlashGBX.app import AppContext
+from FlashGBX.CartridgeTypes import RomSizes, DmgSaveTypes, AgbSaveTypes
+from FlashGBX.Mapper import get_mbc_name
 from FlashGBX.hw_GBxCartRW import GbxDevice
 from FlashGBX.RomFileDMG import RomFileDMG
 from FlashGBX.RomFileAGB import RomFileAGB
@@ -742,7 +747,7 @@ def format_size(n):
 # ---------------------------------------------------------------------------
 def load_flashcarts():
     """Load flash cartridge config files the same way FlashGBX does."""
-    app_path = os.path.dirname(os.path.abspath(Util.__file__))
+    app_path = os.path.dirname(os.path.abspath(fgbx_app.__file__))
     config_path = os.path.expanduser("~") + "/FlashGBX"
 
     class FakeArgs:
@@ -754,8 +759,9 @@ def load_flashcarts():
         "argparsed": FakeArgs(),
     }
     try:
+        AppContext.APP_PATH = app_path
+        AppContext.CONFIG_PATH = config_path
         cfg = LoadConfig(args)
-        Util.CONFIG_PATH = config_path
         return cfg["flashcarts"]
     except Exception:
         return {"DMG": {}, "AGB": {}}
@@ -787,7 +793,7 @@ def detect_mode(dev):
     for mode in ("DMG", "AGB"):
         dev.SetMode(mode)
         time.sleep(0.2)
-        header = dev.ReadInfo()
+        header = dev.ReadHeader()
         if header is False or header == {}:
             continue
         if header.get("empty_nocart", True) or header.get("empty", True):
@@ -802,8 +808,8 @@ def get_rom_size(mode, header):
     """Determine the ROM size in bytes from the header."""
     if mode == "DMG":
         raw = header.get("rom_size_raw", 0)
-        if raw < len(Util.DMG_Header_ROM_Sizes_Flasher_Map):
-            return Util.DMG_Header_ROM_Sizes_Flasher_Map[raw]
+        if raw < len(RomSizes.ROM_SIZES_DMG):
+            return RomSizes.ROM_SIZES_DMG[raw]
         return 2 * 1024 * 1024  # fallback: 2 MiB
     else:  # AGB
         if "rom_size" in header:
@@ -833,11 +839,11 @@ def get_save_info(mode, header):
         save_type = header.get("ram_size_raw", 0)
         if save_type == 0:
             return 0, 0
-        if save_type not in Util.DMG_Header_RAM_Sizes_Map:
+        entry = DmgSaveTypes(mbc=save_type)
+        if entry.GetMbc() is None:
             warn(f"Unknown save type 0x{save_type:X}; skipping save.")
             return 0, 0
-        idx = Util.DMG_Header_RAM_Sizes_Map.index(save_type)
-        save_size = Util.DMG_Header_RAM_Sizes_Flasher_Map[idx]
+        save_size = entry.GetSize()
         if save_size == 0:
             return 0, 0
         return save_type, save_size
@@ -846,8 +852,8 @@ def get_save_info(mode, header):
         st = header.get("save_type", None)
         if st is None or st == 0:
             return 0, 0
-        if st < len(Util.AGB_Header_Save_Sizes):
-            return st, Util.AGB_Header_Save_Sizes[st]
+        if st < len(AgbSaveTypes.SAVE_TYPES):
+            return st, AgbSaveTypes().GetSize(st)
         return 0, 0
 
 
@@ -870,7 +876,9 @@ def sanitize_title(title):
 def detect_save_type_agb(dev):
     """Run FlashGBX's cartridge auto-detection to find the AGB save type."""
     status("Auto-detecting GBA save type...")
-    ret = dev.DoDetectCartridge(limitVoltage=False, checkSaveType=True)
+    # FlashGBX 5.0's public DetectCartridge() dispatches to a worker thread; we want
+    # the blocking form, same as the TransferData() calls elsewhere in this script.
+    ret = dev._DetectCartridge_Worker(mbc=None, limitVoltage=False, checkSaveType=True)
     if ret is None or ret is False:
         return 0, 0
     _info, save_size, save_type, *_ = ret
@@ -880,13 +888,13 @@ def detect_save_type_agb(dev):
 def save_type_name(mode, save_type):
     """Human-readable name for a save type."""
     if mode == "DMG":
-        if save_type in Util.DMG_Header_RAM_Sizes_Map:
-            idx = Util.DMG_Header_RAM_Sizes_Map.index(save_type)
-            return Util.DMG_Header_RAM_Sizes[idx]
+        entry = DmgSaveTypes(mbc=save_type)
+        if entry.GetMbc() is not None:
+            return entry.GetName()
         return f"type 0x{save_type:X}"
     else:
-        if save_type < len(Util.AGB_Header_Save_Types):
-            return Util.AGB_Header_Save_Types[save_type]
+        if save_type < len(AgbSaveTypes.SAVE_TYPES):
+            return AgbSaveTypes().GetName(save_type)
         return f"type {save_type}"
 
 
@@ -1722,7 +1730,7 @@ def main():
         mode = args.mode.upper()
         dev.SetMode(mode)
         time.sleep(0.2)
-        header = dev.ReadInfo()
+        header = dev.ReadHeader()
         if header is False or header == {} or header.get("empty_nocart", True):
             fatal("No cartridge detected in the selected mode.", dev=dev)
 
@@ -1734,7 +1742,7 @@ def main():
         rom_size_str = header.get("rom_size", "?")
         ram_size_str = header.get("ram_size", "?")
         mbc_raw = header.get("mapper_raw", 0)
-        mbc_name = Util.DMG_Header_Mapper.get(mbc_raw, f"0x{mbc_raw:02X}") if isinstance(Util.DMG_Header_Mapper, dict) else f"0x{mbc_raw:02X}"
+        mbc_name = header.get("mapper") or get_mbc_name(mbc_raw)
         print(f"  ROM: {rom_size_str}  |  RAM: {ram_size_str}  |  Mapper: {mbc_name}")
     else:
         game_code = header.get("game_code", "")
@@ -1790,7 +1798,7 @@ def main():
         status("Preparing to write save back to cartridge…")
         dev.SetMode(mode)
         time.sleep(0.3)
-        check_header = dev.ReadInfo()
+        check_header = dev.ReadHeader()
         if check_header and not check_header.get("empty_nocart", True):
             progress = ProgressWindow(game_title)
             write_save(dev, mode, header, save_path, progress)
